@@ -62,14 +62,11 @@ pub fn start(run_dir: &std::path::Path, config: &ApConfig) -> Result<ApSession> 
 
     // dnsmasq first: if hostapd comes up and a client associates before DHCP is listening, that
     // client waits out a lease timeout for no reason.
+    let dnsmasq_args = dnsmasq_args(&dnsmasq_conf);
     let dnsmasq = Daemon::spawn(
         "dnsmasq",
         "dnsmasq",
-        &[
-            "--keep-in-foreground",
-            "--conf-file",
-            &dnsmasq_conf.to_string_lossy(),
-        ],
+        &dnsmasq_args.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
 
     let hostapd = Daemon::spawn("hostapd", "hostapd", &[&hostapd_conf.to_string_lossy()])?;
@@ -79,4 +76,36 @@ pub fn start(run_dir: &std::path::Path, config: &ApConfig) -> Result<ApSession> 
         dnsmasq,
         interface: config.interface.clone(),
     })
+}
+
+fn dnsmasq_args(conf: &std::path::Path) -> Vec<String> {
+    vec![
+        "--keep-in-foreground".to_string(),
+        format!("--conf-file={}", conf.display()),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_conf_file_is_passed_with_an_equals_sign() {
+        let args = dnsmasq_args(Path::new("/run/robot-wifi/dnsmasq.conf"));
+
+        assert_eq!(
+            args,
+            [
+                "--keep-in-foreground",
+                "--conf-file=/run/robot-wifi/dnsmasq.conf"
+            ]
+        );
+
+        // The bug this replaced: a bare `--conf-file` with the path as its own argument.
+        assert!(
+            !args.iter().any(|arg| arg == "--conf-file"),
+            "the path must be attached with '=', not passed as a separate argument"
+        );
+    }
 }
