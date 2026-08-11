@@ -38,7 +38,7 @@ enum Kind {
     /// Rendered as `&str`. An empty value is rejected: every one of these has a meaningful
     /// default, and `config` treats an empty *environment* value as "unset" for the same reason.
     Str,
-    /// Rendered as `&str`, empty allowed -- for the one knob where empty means something.
+    /// Rendered as `&str`, empty allowed -- for the knobs where empty means something.
     OptionalStr,
     /// Rendered as `&str`, validated against the `RobotId` rules.
     RobotId,
@@ -116,12 +116,23 @@ const KNOBS: &[Knob] = &[
               stop, and `status` reports its health.",
     },
     Knob {
+        var: "ROBOTCTL_WIFI_STATE_HOOK",
+        konst: "DEFAULT_WIFI_STATE_HOOK",
+        kind: Kind::OptionalStr,
+        value: "",
+        doc: "Command run on every supervisor state change, with the state name as its only \
+              argument. Empty -- the platform-neutral default -- runs nothing. This is the whole \
+              of what `robotctl` knows about status indicators: what a robot does with the state \
+              belongs to that robot's own image.",
+    },
+    Knob {
         var: "ROBOTCTL_MDNS_UNIT",
         konst: "DEFAULT_MDNS_UNIT",
         kind: Kind::OptionalStr,
         value: "avahi-daemon.service",
         doc: "The mDNS responder to nudge after a hostname change. Empty disables the nudge -- \
-              the one knob where empty does not mean \"use the default\".",
+              one of the two knobs (with ROBOTCTL_WIFI_STATE_HOOK) where empty does not mean \
+              \"use the default\".",
     },
     Knob {
         var: "ROBOTCTL_IMAGE_VERSION_PATH",

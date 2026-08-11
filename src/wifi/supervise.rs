@@ -11,6 +11,7 @@ use crate::log;
 use crate::wifi::ap::{self, ApSession};
 use crate::wifi::client::{self, ClientFailure, ClientSession};
 use crate::wifi::config_gen;
+use crate::wifi::hook;
 use crate::wifi::net;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,17 @@ pub enum State {
     ClientUp,
     /// Serving the recovery AP, periodically re-trying the client network.
     FallbackAp,
+}
+
+impl State {
+    /// The name this state is known by outside the binary.
+    pub fn hook_name(self) -> &'static str {
+        match self {
+            State::TryClient => "try-client",
+            State::ClientUp => "client-up",
+            State::FallbackAp => "fallback-ap",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,12 +101,15 @@ pub fn run(paths: &Paths, tuning: &SuperviseTuning) -> Result<()> {
     let mut state = State::TryClient;
     let mut announced_ready = false;
 
+    hook::notify(paths.wifi_state_hook(), state.hook_name());
+
     loop {
         let event = supervisor.step(state)?;
         let next = next_state(state, event);
 
         if next != state {
             log::info(format!("{state:?} -> {next:?} ({event:?})"));
+            hook::notify(paths.wifi_state_hook(), next.hook_name());
         }
 
         if !announced_ready && matches!(next, State::ClientUp | State::FallbackAp) {
@@ -342,6 +357,19 @@ mod tests {
                 let next = next_state(state, event);
                 assert!(states.contains(&next), "{state:?} + {event:?} -> {next:?}");
             }
+        }
+    }
+
+    #[test]
+    fn every_state_has_a_stable_hook_name() {
+        // Pinned literally, because these names are what an image's state hook switches on.
+        assert_eq!(State::TryClient.hook_name(), "try-client");
+        assert_eq!(State::ClientUp.hook_name(), "client-up");
+        assert_eq!(State::FallbackAp.hook_name(), "fallback-ap");
+
+        // `off` is not a supervisor state, so nothing may collide with it.
+        for state in [State::TryClient, State::ClientUp, State::FallbackAp] {
+            assert_ne!(state.hook_name(), crate::wifi::hook::OFF);
         }
     }
 

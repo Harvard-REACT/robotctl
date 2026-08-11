@@ -4,6 +4,7 @@ pub mod ap;
 pub mod client;
 pub mod config_gen;
 pub mod daemon;
+pub mod hook;
 pub mod net;
 pub mod supervise;
 
@@ -37,6 +38,11 @@ pub fn stop(paths: &Paths) -> Result<()> {
             "{unit} is {state}; if `robotctl wifi start` is running by hand, stop it there"
         )),
     }
+
+    // Announced here rather than after the teardown below, so the two paths out of this function
+    // agree: once the supervisor is stopped there is no WiFi to indicate, whether or not the
+    // interface is still around to be flushed.
+    hook::notify(paths.wifi_state_hook(), hook::OFF);
 
     if !net::interface_exists(interface) {
         log::info(format!("{interface} does not exist; nothing to tear down"));

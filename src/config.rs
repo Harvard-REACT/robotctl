@@ -24,7 +24,7 @@ use defaults::{
     DEFAULT_IMAGE_VERSION_PATH, DEFAULT_MDNS_UNIT, DEFAULT_ROBOT_ID, DEFAULT_ROS_DOMAIN_ID,
     DEFAULT_RUN_DIR, DEFAULT_TRYBOOT_BACKEND, DEFAULT_WIFI_AP_RETRY_SEC,
     DEFAULT_WIFI_CLIENT_ATTEMPTS, DEFAULT_WIFI_CONNECT_TIMEOUT_SEC, DEFAULT_WIFI_INTERFACE,
-    DEFAULT_WIFI_LINK_POLL_SEC, DEFAULT_WIFI_RETRY_SEC, DEFAULT_WIFI_UNIT,
+    DEFAULT_WIFI_LINK_POLL_SEC, DEFAULT_WIFI_RETRY_SEC, DEFAULT_WIFI_STATE_HOOK, DEFAULT_WIFI_UNIT,
 };
 
 /// Resolved configuration, built once at startup and passed down.
@@ -37,6 +37,7 @@ pub struct Paths {
     wifi_run_dir: PathBuf,
     wifi_interface: String,
     wifi_unit: String,
+    wifi_state_hook: String,
     mdns_unit: String,
     image_version_path: PathBuf,
     tryboot_backend: PathBuf,
@@ -58,8 +59,8 @@ impl Paths {
             wifi_run_dir: path_from_env("ROBOTCTL_RUN_DIR", DEFAULT_RUN_DIR),
             wifi_interface: string_from_env("ROBOTCTL_WIFI_INTERFACE", DEFAULT_WIFI_INTERFACE),
             wifi_unit: string_from_env("ROBOTCTL_WIFI_UNIT", DEFAULT_WIFI_UNIT),
-            // Not `string_from_env`: an explicitly empty value means "do not nudge anything",
-            // which that helper would turn back into the default.
+            wifi_state_hook: env::var("ROBOTCTL_WIFI_STATE_HOOK")
+                .unwrap_or_else(|_| DEFAULT_WIFI_STATE_HOOK.into()),
             mdns_unit: env::var("ROBOTCTL_MDNS_UNIT").unwrap_or_else(|_| DEFAULT_MDNS_UNIT.into()),
             image_version_path: path_from_env(
                 "ROBOTCTL_IMAGE_VERSION_PATH",
@@ -108,6 +109,10 @@ impl Paths {
         &self.wifi_unit
     }
 
+    pub fn wifi_state_hook(&self) -> &str {
+        self.wifi_state_hook.trim()
+    }
+
     pub fn mdns_unit(&self) -> &str {
         self.mdns_unit.trim()
     }
@@ -140,6 +145,7 @@ impl Paths {
             wifi_run_dir: root.join("run/robot-wifi"),
             wifi_interface: DEFAULT_WIFI_INTERFACE.to_string(),
             wifi_unit: DEFAULT_WIFI_UNIT.to_string(),
+            wifi_state_hook: String::new(),
             mdns_unit: String::new(),
             image_version_path: root.join("etc/robot/image-version"),
             tryboot_backend: root.join("usr/libexec/rauc/tryboot-backend"),
