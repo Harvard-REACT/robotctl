@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::conf;
 use crate::config::Paths;
 use crate::log;
+use crate::systemd;
 
 const ROBOT_ID_KEY: &str = "ROBOT_ID";
 const ROS_DOMAIN_ID_KEY: &str = "ROS_DOMAIN_ID";
@@ -207,14 +208,21 @@ fn set_key(path: &Path, key: &str, value: &str) -> Result<()> {
 /// Idempotent by construction: files are compared before being written, so the steady-state boot
 /// costs zero writes to the rootfs. Safe to run on every boot and by hand at any time.
 pub fn apply(paths: &Paths, config: &RobotConfig) -> Result<()> {
-    apply_files(paths, config)?;
+    let renamed = apply_files(paths, config)?;
     apply_runtime_hostname(&config.robot_id);
+
+    if renamed {
+        systemd::try_restart_async(paths.mdns_unit());
+    }
+
     Ok(())
 }
 
-fn apply_files(paths: &Paths, config: &RobotConfig) -> Result<()> {
+fn apply_files(paths: &Paths, config: &RobotConfig) -> Result<bool> {
     let hostname_path = paths.hostname_path();
-    if conf::write_if_changed(hostname_path, &render_hostname_file(&config.robot_id))? {
+    let hostname_changed =
+        conf::write_if_changed(hostname_path, &render_hostname_file(&config.robot_id))?;
+    if hostname_changed {
         log::info(format!(
             "{} now reads '{}'",
             hostname_path.display(),
@@ -233,7 +241,7 @@ fn apply_files(paths: &Paths, config: &RobotConfig) -> Result<()> {
         ));
     }
 
-    Ok(())
+    Ok(hostname_changed)
 }
 
 fn render_hostname_file(robot_id: &RobotId) -> String {
@@ -474,8 +482,10 @@ mod tests {
 
         let config = load(&paths).unwrap();
 
-        assert_eq!(config.robot_id.as_str(), "unprovisioned");
-        assert_eq!(config.ros_domain_id.value(), 0);
+        // Against the compiled-in defaults rather than literals: which values those are depends on
+        // the build profile (see `build.rs`), but falling back to them does not.
+        assert_eq!(&config.robot_id, paths.default_robot_id());
+        assert_eq!(config.ros_domain_id, paths.default_ros_domain_id());
     }
 
     #[test]
@@ -488,7 +498,7 @@ mod tests {
         let config = load(&paths).unwrap();
 
         // The bad key falls back; the good one is still honoured.
-        assert_eq!(config.robot_id.as_str(), "unprovisioned");
+        assert_eq!(&config.robot_id, paths.default_robot_id());
         assert_eq!(config.ros_domain_id.value(), 9);
     }
 

@@ -20,6 +20,24 @@ pub fn is_active(unit: &str) -> String {
     }
 }
 
+pub fn try_restart_async(unit: &str) {
+    if unit.is_empty() {
+        return;
+    }
+
+    let result = Command::new("systemctl")
+        .args(["--no-block", "try-restart", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    match result {
+        Ok(status) if status.success() => crate::log::info(format!("asked {unit} to restart")),
+        _ => crate::log::info(format!("could not restart {unit}")),
+    }
+}
+
 pub fn stop(unit: &str) -> Result<()> {
     let status = Command::new("systemctl")
         .args(["stop", unit])

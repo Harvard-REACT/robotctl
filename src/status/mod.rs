@@ -18,12 +18,10 @@ use crate::wifi::net::{self, InterfaceMode};
 
 /// Units worth reporting whether or not they exist.
 const WATCHED_UNITS: &[&str] = &[
+    "robotctl-id-apply.service",
     "robotctl-wifi.service",
-    "robot-wifi-supervisor.service",
-    "robot-wifi-client.service",
-    "robot-wifi-fallback-ap.service",
+    "robotctl-experiments.service",
     "docker.service",
-    "robot-experiments.service",
     "robot-update-health-check.service",
 ];
 

@@ -18,7 +18,10 @@ use crate::config::Paths;
 use crate::id::{RobotId, RosDomainId};
 
 #[derive(Parser, Debug)]
-#[command(version, about)]
+// `--version` names the build profile as well as the version, because two images built from the
+// same commit can carry different compiled-in defaults and nothing on the robot would otherwise
+// say which. `-V` stays the bare version.
+#[command(version, long_version = config::LONG_VERSION, about)]
 struct Args {
     #[command(subcommand)]
     command: RobotctlCommand,
