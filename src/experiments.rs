@@ -1,6 +1,8 @@
 //! Experiment stacks: `docker compose` against `/data/experiments/<name>/docker-compose.yml`.
 
 use std::fmt;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -12,16 +14,25 @@ use crate::config::Paths;
 use crate::log;
 
 const ENABLED_CONF_TEMPLATE: &str = "\
-# One experiment name per line = enabled. Lines starting with # and blank
+# One experiment per line = enabled. Lines starting with # and blank
 # lines are ignored. Each name must have a matching directory:
 #   <experiments-dir>/<name>/docker-compose.yml
+#
+# A name may name the docker compose profiles to activate for it, as a
+# comma-separated list after a colon:
+#   my-experiment:gpu,debug
+#   my-experiment:*        every profile the compose file declares
+#
+# Those apply when `robotctl experiments start` runs with no arguments, as
+# it does at boot. Naming an experiment on the command line *replaces* them
+# for that run: `robotctl experiments start my-experiment` activates no
+# profiles at all, and `... my-experiment:gpu` activates only gpu.
 #
 # Example:
 # my-experiment
 ";
 
-/// Written when `experiments.conf` doesn't exist, so the setting is discoverable on the robot
-/// rather than being a flag someone has to know about.
+/// Written when `experiments.conf` doesn't exist
 const SETTINGS_TEMPLATE: &str = "\
 # Settings for `robotctl experiments`, in shell-style KEY=value form.
 #
@@ -40,6 +51,7 @@ IGNORE_PULL_FAILURES=false
 ";
 
 const IGNORE_PULL_FAILURES_KEY: &str = "IGNORE_PULL_FAILURES";
+const ALL_PROFILES: &str = "*";
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ExperimentNameError {
@@ -60,7 +72,7 @@ pub enum ExperimentNameError {
 }
 
 /// A validated experiment name — safe to join onto a directory path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExperimentName(String);
 
 impl ExperimentName {
@@ -104,16 +116,222 @@ impl fmt::Display for ExperimentName {
     }
 }
 
-/// The result of reading `enabled.conf`: the names to act on, and everything rejected on the way.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum ProfileNameError {
+    #[error("must not be empty")]
+    Empty,
+
+    #[error("must start with a letter or a digit (found '{found}')")]
+    InvalidStart { found: char },
+
+    #[error("may only contain letters, digits, '.', '_' and '-' (found '{found}')")]
+    InvalidCharacter { found: char },
+}
+
+/// A validated docker compose profile name.
+///
+/// Compose's schema is `[a-zA-Z0-9][a-zA-Z0-9_.-]*`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileName(String);
+
+impl ProfileName {
+    pub fn new(name: &str) -> Result<Self, ProfileNameError> {
+        let mut chars = name.chars();
+
+        let Some(first) = chars.next() else {
+            return Err(ProfileNameError::Empty);
+        };
+
+        if !first.is_ascii_alphanumeric() {
+            return Err(ProfileNameError::InvalidStart { found: first });
+        }
+
+        if let Some(found) =
+            chars.find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
+        {
+            return Err(ProfileNameError::InvalidCharacter { found });
+        }
+
+        Ok(ProfileName(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProfileName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Which compose profiles to activate for one experiment.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Profiles {
+    /// No profiles: only services with no `profiles:` key of their own.
+    #[default]
+    None,
+    /// Every profile the compose file declares — compose's `--profile "*"`.
+    All,
+    Named(Vec<ProfileName>),
+}
+
+impl Profiles {
+    /// The `--profile` flags to put before the compose verb.
+    fn args(&self) -> Vec<String> {
+        let names: Vec<&str> = match self {
+            Profiles::None => return Vec::new(),
+            Profiles::All => vec![ALL_PROFILES],
+            Profiles::Named(names) => names.iter().map(ProfileName::as_str).collect(),
+        };
+
+        names
+            .into_iter()
+            .flat_map(|name| ["--profile".to_string(), name.to_string()])
+            .collect()
+    }
+
+    /// Combines two profile sets for the same experiment named twice in one invocation.
+    fn merged(self, other: Profiles) -> Profiles {
+        match (self, other) {
+            (Profiles::All, _) | (_, Profiles::All) => Profiles::All,
+            (Profiles::None, other) => other,
+            (mine, Profiles::None) => mine,
+            (Profiles::Named(mut mine), Profiles::Named(other)) => {
+                for name in other {
+                    if !mine.contains(&name) {
+                        mine.push(name);
+                    }
+                }
+                Profiles::Named(mine)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Profiles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Profiles::None => Ok(()),
+            Profiles::All => f.write_str(ALL_PROFILES),
+            Profiles::Named(names) => {
+                for (index, name) in names.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{name}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum TargetError {
+    #[error("'{name}' is not a valid experiment name: {source}")]
+    Name {
+        name: String,
+        source: ExperimentNameError,
+    },
+
+    #[error("'{profile}' is not a valid compose profile: {source}")]
+    Profile {
+        profile: String,
+        source: ProfileNameError,
+    },
+
+    #[error("'{ALL_PROFILES}' already means every profile, so it cannot be combined with others")]
+    WildcardWithOthers,
+}
+
+/// One experiment to act on, and the profiles to act on it with.
+///
+/// Parsed from `name[:profile[,profile...]]` — a colon cannot appear in an experiment name, so
+/// the suffix is unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub name: ExperimentName,
+    pub profiles: Profiles,
+}
+
+impl Target {
+    pub fn new(name: ExperimentName, profiles: Profiles) -> Self {
+        Target { name, profiles }
+    }
+
+    /// Parses one `name[:profile[,profile...]]` argument.
+    ///
+    /// A bare `name` and a trailing-colon `name:` both mean "no profiles": the command line is
+    /// authoritative, so naming an experiment explicitly never inherits what `enabled.conf`
+    /// configured for it.
+    pub fn parse(spec: &str) -> Result<Self, TargetError> {
+        let spec = spec.trim();
+
+        let (name, suffix) = match spec.split_once(':') {
+            Some((name, suffix)) => (name.trim(), Some(suffix.trim())),
+            None => (spec, None),
+        };
+
+        let name = ExperimentName::new(name).map_err(|source| TargetError::Name {
+            name: name.to_string(),
+            source,
+        })?;
+
+        let profiles = match suffix {
+            None | Some("") => Profiles::None,
+            Some(ALL_PROFILES) => Profiles::All,
+            Some(list) => {
+                let mut names: Vec<ProfileName> = Vec::new();
+
+                for entry in list.split(',') {
+                    let entry = entry.trim();
+
+                    if entry == ALL_PROFILES {
+                        return Err(TargetError::WildcardWithOthers);
+                    }
+
+                    let profile =
+                        ProfileName::new(entry).map_err(|source| TargetError::Profile {
+                            profile: entry.to_string(),
+                            source,
+                        })?;
+
+                    if !names.contains(&profile) {
+                        names.push(profile);
+                    }
+                }
+
+                Profiles::Named(names)
+            }
+        };
+
+        Ok(Target::new(name, profiles))
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.profiles {
+            Profiles::None => write!(f, "{}", self.name),
+            profiles => write!(f, "{} (profiles: {profiles})", self.name),
+        }
+    }
+}
+
+/// The result of reading `enabled.conf`: the targets to act on, and everything rejected on the way.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct EnabledList {
-    pub names: Vec<ExperimentName>,
+    pub targets: Vec<Target>,
     pub warnings: Vec<String>,
 }
 
-/// Parses `enabled.conf`: one name per line, `#` comments and blank lines ignored.
+/// Parses `enabled.conf`: one `name[:profiles]` per line, `#` comments and blank lines ignored.
 ///
-/// Duplicates are dropped with a warning.
+/// Duplicate names are dropped with a warning. Unlike the command line, where naming an
+/// experiment twice merges its profile sets, a hand-edited file listing one twice is a mistake
+/// worth pointing at rather than quietly reconciling.
 pub fn parse_enabled(text: &str) -> EnabledList {
     let mut list = EnabledList::default();
 
@@ -124,17 +342,20 @@ pub fn parse_enabled(text: &str) -> EnabledList {
             continue;
         }
 
-        match ExperimentName::new(line) {
+        match Target::parse(line) {
             Err(err) => list
                 .warnings
-                .push(format!("line {}: '{line}' {err}", number + 1)),
+                .push(format!("line {}: '{line}': {err}", number + 1)),
 
-            Ok(name) if list.names.contains(&name) => list.warnings.push(format!(
-                "line {}: '{name}' is listed more than once",
-                number + 1
-            )),
+            Ok(target) if list.targets.iter().any(|other| other.name == target.name) => {
+                list.warnings.push(format!(
+                    "line {}: '{}' is listed more than once",
+                    number + 1,
+                    target.name
+                ))
+            }
 
-            Ok(name) => list.names.push(name),
+            Ok(target) => list.targets.push(target),
         }
     }
 
@@ -181,7 +402,11 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// Pulls images and brings every enabled stack up.
+/// Pulls images and brings the selected stacks up.
+///
+/// With no targets, that is everything in `enabled.conf`, with the profiles configured there —
+/// which is how the boot-time systemd unit invokes it, and the only way profiles can differ
+/// per robot, since the unit's `ExecStart` is baked into the image.
 ///
 /// A failed pull is fatal by default, and the experiment is *not* started.
 ///
@@ -194,7 +419,11 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// Failures are collected rather than raised at the first one: an unreachable registry should
 /// not stop the *other* experiments from being attempted. The command still exits non-zero, so
 /// the systemd unit fails and `robotctl status` reports it.
-pub fn start(paths: &Paths, options: StartOptions) -> Result<()> {
+pub fn start(paths: &Paths, targets: Vec<Target>, options: StartOptions) -> Result<()> {
+    require_docker()?;
+
+    let (dir, targets) = select(paths, targets, Fallback::Enabled)?;
+
     let settings_path = paths.experiments_dir().join("experiments.conf");
     ensure_file(&settings_path, SETTINGS_TEMPLATE)?;
 
@@ -210,10 +439,12 @@ pub fn start(paths: &Paths, options: StartOptions) -> Result<()> {
 
     let mut failed: Vec<String> = Vec::new();
 
-    for_each_enabled(paths, |dir, name| {
-        log::info(format!("pulling images for experiment '{name}'"));
+    for target in &targets {
+        let Target { name, profiles } = target;
 
-        if let Err(err) = compose(dir, name, &["pull", "--quiet"]) {
+        log::info(format!("pulling images for experiment '{target}'"));
+
+        if let Err(err) = compose(&dir, name, profiles, &["pull", "--quiet"]) {
             if !ignore_pull_failures {
                 log::error(format!(
                     "pull failed for '{name}': {err:#}. Not starting it — the local image may be \
@@ -222,7 +453,7 @@ pub fn start(paths: &Paths, options: StartOptions) -> Result<()> {
                     settings_path.display()
                 ));
                 failed.push(name.to_string());
-                return;
+                continue;
             }
 
             log::warn(format!(
@@ -231,48 +462,251 @@ pub fn start(paths: &Paths, options: StartOptions) -> Result<()> {
             ));
         }
 
-        log::info(format!("starting experiment '{name}'"));
-        if let Err(err) = compose(dir, name, &["up", "-d", "--remove-orphans"]) {
-            log::warn(format!("failed to start experiment '{name}': {err:#}"));
-        }
-    })?;
+        log::info(format!("starting experiment '{target}'"));
 
-    if !failed.is_empty() {
-        anyhow::bail!(
-            "could not pull images for {} of the enabled experiments: {}",
-            failed.len(),
-            failed.join(", ")
-        );
+        if let Err(err) = compose(&dir, name, profiles, &["up", "-d", "--remove-orphans"]) {
+            log::error(format!("failed to start experiment '{name}': {err:#}"));
+            failed.push(name.to_string());
+        }
+    }
+
+    report(&failed, targets.len(), "start")
+}
+
+/// Brings the selected stacks down.
+///
+/// With no targets this sweeps *every* stack directory on disk, not just the enabled ones: an
+/// experiment removed from `enabled.conf` while still running would otherwise never be stopped
+/// by anything. `down` on a stack that isn't running is a cheap no-op.
+///
+/// Unless the caller narrowed it to specific profiles, every profile is activated
+/// (`--profile "*"`) and orphans are removed, because compose's `down` only removes containers
+/// for services in the *active* profile set — so a plain `down` would strand containers that
+/// were started under a profile. Stop means stop.
+pub fn stop(paths: &Paths, targets: Vec<Target>) -> Result<()> {
+    require_docker()?;
+
+    let (dir, targets) = select(paths, targets, Fallback::EverythingOnDisk)?;
+
+    let mut failed: Vec<String> = Vec::new();
+
+    for target in &targets {
+        // `Profiles::None` here means the caller said nothing about profiles, not that they want
+        // a profile-less teardown — there is no such thing, since the goal is an empty project.
+        let (profiles, verb): (Profiles, &[&str]) = match &target.profiles {
+            Profiles::Named(_) => (target.profiles.clone(), &["down"]),
+            _ => (Profiles::All, &["down", "--remove-orphans"]),
+        };
+
+        log::info(format!("stopping experiment '{target}'"));
+
+        if let Err(err) = compose(&dir, &target.name, &profiles, verb) {
+            log::error(format!(
+                "failed to stop experiment '{}': {err:#}",
+                target.name
+            ));
+            failed.push(target.name.to_string());
+        }
+    }
+
+    report(&failed, targets.len(), "stop")
+}
+
+/// `docker compose ps` for the selected stacks.
+///
+/// Per-experiment failures stay warnings and the command still exits 0: a report that aborts
+/// because one stack could not be queried is least useful exactly when something is wrong.
+pub fn status(paths: &Paths, targets: Vec<Target>) -> Result<()> {
+    require_docker()?;
+
+    let (dir, targets) = select(paths, targets, Fallback::Enabled)?;
+
+    for target in &targets {
+        println!("== {target} ==");
+
+        if let Err(err) = compose(&dir, &target.name, &target.profiles, &["ps"]) {
+            log::warn(format!(
+                "could not query experiment '{}': {err:#}",
+                target.name
+            ));
+        }
     }
 
     Ok(())
 }
 
-pub fn stop(paths: &Paths) -> Result<()> {
-    for_each_enabled(paths, |dir, name| {
-        log::info(format!("stopping experiment '{name}'"));
-        if let Err(err) = compose(dir, name, &["down"]) {
-            log::warn(format!("failed to stop experiment '{name}': {err:#}"));
-        }
-    })
-}
-
-pub fn status(paths: &Paths) -> Result<()> {
-    for_each_enabled(paths, |dir, name| {
-        println!("== {name} ==");
-        if let Err(err) = compose(dir, name, &["ps"]) {
-            log::warn(format!("could not query experiment '{name}': {err:#}"));
-        }
-    })
-}
-
-/// Reads `enabled.conf` and runs `action` for every enabled experiment that has a compose file.
+/// What exists on this robot: every stack directory, whether it is enabled, the profiles
+/// `enabled.conf` configures for it, and the profiles its compose file declares.
 ///
-/// Every per-experiment failure is a non-fatal warning.
-fn for_each_enabled(paths: &Paths, mut action: impl FnMut(&Path, &ExperimentName)) -> Result<()> {
-    require_docker()?;
-
+/// The available-profiles column comes from `docker compose config --profiles` rather than a
+/// YAML parser of our own — same reasoning as everywhere else in this module: compose's own
+/// semantics are a large surface, and re-implementing a corner of it is how the two drift.
+pub fn list(paths: &Paths) -> Result<()> {
     let dir = paths.experiments_dir();
+
+    let enabled = match conf::read_optional(&dir.join("enabled.conf"))? {
+        Some(text) => parse_enabled(&text).targets,
+        None => Vec::new(),
+    };
+
+    let mut names = on_disk(&dir)?;
+
+    // An enabled name with nothing on disk is exactly what someone running this command wants
+    // to be told about, so it gets a row rather than being silently absent.
+    for target in &enabled {
+        if !names.contains(&target.name) {
+            names.push(target.name.clone());
+        }
+    }
+    names.sort();
+
+    if names.is_empty() {
+        log::info(format!("no experiments in {}", dir.display()));
+        return Ok(());
+    }
+
+    let rows: Vec<[String; 4]> = names
+        .iter()
+        .map(|name| {
+            let configured = enabled
+                .iter()
+                .find(|target| &target.name == name)
+                .map(|target| target.profiles.to_string())
+                .filter(|profiles| !profiles.is_empty());
+
+            let available = if compose_file(&dir, name).is_file() {
+                match declared_profiles(&dir, name) {
+                    Ok(profiles) if profiles.is_empty() => "-".to_string(),
+                    Ok(profiles) => profiles.join(", "),
+                    // Only the column is unknown; the row is still worth printing.
+                    Err(_) => "?".to_string(),
+                }
+            } else {
+                "(no compose file)".to_string()
+            };
+
+            [
+                name.to_string(),
+                if enabled.iter().any(|target| &target.name == name) {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
+                configured.unwrap_or_else(|| "-".to_string()),
+                available,
+            ]
+        })
+        .collect();
+
+    print_table(
+        ["NAME", "ENABLED", "CONFIGURED", "AVAILABLE PROFILES"],
+        &rows,
+    );
+
+    Ok(())
+}
+
+/// Left-aligned columns, sized to their contents. The last column is not padded.
+fn print_table(headers: [&str; 4], rows: &[[String; 4]]) {
+    let mut widths = headers.map(str::len);
+
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+
+    let line = |cells: [&str; 4]| {
+        let mut out = String::new();
+        for (index, cell) in cells.iter().enumerate() {
+            if index + 1 == cells.len() {
+                out.push_str(cell);
+            } else {
+                out.push_str(&format!("{cell:<width$}  ", width = widths[index]));
+            }
+        }
+        println!("{}", out.trim_end());
+    };
+
+    line(headers);
+
+    for row in rows {
+        line([&row[0], &row[1], &row[2], &row[3]]);
+    }
+}
+
+/// What to act on when the command line named nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    /// `enabled.conf`, with the profiles configured there.
+    Enabled,
+    /// Every stack directory that has a compose file.
+    EverythingOnDisk,
+}
+
+/// Turns what the command line asked for into the exact list to act on.
+///
+/// Explicitly named experiments are validated up front and a missing one is fatal *before*
+/// anything is started or stopped: an argument is a direct instruction, and half-executing it
+/// after a typo is worse than executing none of it. Names that come from `enabled.conf` keep
+/// the older, softer treatment — a warning and a skip — because that file is read unattended
+/// at boot, where refusing to start the other four stacks helps nobody.
+fn select(
+    paths: &Paths,
+    targets: Vec<Target>,
+    fallback: Fallback,
+) -> Result<(PathBuf, Vec<Target>)> {
+    let dir = paths.experiments_dir();
+
+    if !targets.is_empty() {
+        let targets = merge_duplicates(targets);
+
+        let missing: Vec<&Target> = targets
+            .iter()
+            .filter(|target| !compose_file(&dir, &target.name).is_file())
+            .collect();
+
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "no compose file for {} of the named experiments (nothing was done):\n{}",
+                missing.len(),
+                missing
+                    .iter()
+                    .map(|target| format!(
+                        "  {}: {} does not exist",
+                        target.name,
+                        compose_file(&dir, &target.name).display()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+
+        return Ok((dir, targets));
+    }
+
+    let targets = match fallback {
+        Fallback::Enabled => enabled_targets(&dir)?,
+        Fallback::EverythingOnDisk => {
+            let names = on_disk(&dir)?;
+
+            if names.is_empty() {
+                log::info(format!("no experiment stacks in {}", dir.display()));
+            }
+
+            names
+                .into_iter()
+                .map(|name| Target::new(name, Profiles::None))
+                .collect()
+        }
+    };
+
+    Ok((dir, targets))
+}
+
+/// Reads `enabled.conf`, creating it from the template if this robot has never had one, and
+/// drops the entries with no compose file with a warning.
+fn enabled_targets(dir: &Path) -> Result<Vec<Target>> {
     let conf_path = dir.join("enabled.conf");
     ensure_file(&conf_path, ENABLED_CONF_TEMPLATE)?;
 
@@ -283,24 +717,96 @@ fn for_each_enabled(paths: &Paths, mut action: impl FnMut(&Path, &ExperimentName
         log::warn(format!("{}: {problem}", conf_path.display()));
     }
 
-    if list.names.is_empty() {
+    if list.targets.is_empty() {
         log::info(format!("no experiments enabled in {}", conf_path.display()));
+        return Ok(Vec::new());
+    }
+
+    Ok(list
+        .targets
+        .into_iter()
+        .filter(|target| {
+            let compose_file = compose_file(dir, &target.name);
+
+            if !compose_file.is_file() {
+                log::warn(format!(
+                    "skipping '{}': no compose file at {}",
+                    target.name,
+                    compose_file.display()
+                ));
+                return false;
+            }
+
+            true
+        })
+        .collect())
+}
+
+/// Every experiment directory that has a compose file, in name order.
+///
+/// Directory names that are not valid experiment names are ignored rather than reported: `/data`
+/// is shared with docker, RAUC and journald, and whatever else lands in there is not ours to
+/// complain about.
+fn on_disk(dir: &Path) -> Result<Vec<ExperimentName>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", dir.display())),
+    };
+
+    let mut names: Vec<ExperimentName> = Vec::new();
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+
+        let Some(name) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| ExperimentName::new(name).ok())
+        else {
+            continue;
+        };
+
+        if compose_file(dir, &name).is_file() {
+            names.push(name);
+        }
+    }
+
+    names.sort();
+
+    Ok(names)
+}
+
+/// Collapses an experiment named more than once into one entry whose profiles are the union.
+///
+/// `start slam:gpu slam:debug` is one `up` with both profiles, not two conflicting ones — a
+/// stack can only be brought up once per invocation, so the alternative is picking a winner.
+fn merge_duplicates(targets: Vec<Target>) -> Vec<Target> {
+    let mut merged: Vec<Target> = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        match merged.iter_mut().find(|other| other.name == target.name) {
+            Some(existing) => {
+                existing.profiles = std::mem::take(&mut existing.profiles).merged(target.profiles)
+            }
+            None => merged.push(target),
+        }
+    }
+
+    merged
+}
+
+/// Fails the command if anything failed, having already attempted everything else.
+fn report(failed: &[String], total: usize, verb: &str) -> Result<()> {
+    if failed.is_empty() {
         return Ok(());
     }
 
-    for name in &list.names {
-        if !compose_file(&dir, name).is_file() {
-            log::warn(format!(
-                "skipping '{name}': no compose file at {}",
-                compose_file(&dir, name).display()
-            ));
-            continue;
-        }
-
-        action(&dir, name);
-    }
-
-    Ok(())
+    anyhow::bail!(
+        "failed to {verb} {} of {total} experiments: {}",
+        failed.len(),
+        failed.join(", ")
+    )
 }
 
 /// Creates `path` from `template` if it does not exist yet, so a fresh robot gets a file that
@@ -322,26 +828,75 @@ fn compose_file(dir: &Path, name: &ExperimentName) -> PathBuf {
     dir.join(name.as_str()).join("docker-compose.yml")
 }
 
-/// Runs `docker compose` for one experiment, with output inherited.
-fn compose(dir: &Path, name: &ExperimentName, args: &[&str]) -> Result<()> {
-    let project_dir = dir.join(name.as_str());
+/// The full `docker compose` argument list for one experiment.
+///
+/// `--profile` is a compose-level flag, so it has to precede the verb.
+fn compose_args(
+    dir: &Path,
+    name: &ExperimentName,
+    profiles: &Profiles,
+    verb: &[&str],
+) -> Vec<String> {
+    let mut args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file(dir, name).to_string_lossy().into_owned(),
+        "--project-directory".to_string(),
+        dir.join(name.as_str()).to_string_lossy().into_owned(),
+    ];
 
+    args.extend(profiles.args());
+    args.extend(verb.iter().map(|arg| arg.to_string()));
+
+    args
+}
+
+/// Runs `docker compose` for one experiment, with output inherited.
+fn compose(dir: &Path, name: &ExperimentName, profiles: &Profiles, verb: &[&str]) -> Result<()> {
     let status = Command::new("docker")
-        .arg("compose")
-        .arg("-f")
-        .arg(compose_file(dir, name))
-        .arg("--project-directory")
-        .arg(&project_dir)
-        .args(args)
+        .args(compose_args(dir, name, profiles, verb))
         .stdin(Stdio::null())
         .status()
-        .with_context(|| format!("running `docker compose {}`", args.join(" ")))?;
+        .with_context(|| format!("running `docker compose {}`", verb.join(" ")))?;
 
     if !status.success() {
-        anyhow::bail!("`docker compose {}` exited with {status}", args.join(" "));
+        anyhow::bail!("`docker compose {}` exited with {status}", verb.join(" "));
     }
 
     Ok(())
+}
+
+/// The profiles one compose file declares, via compose itself.
+fn declared_profiles(dir: &Path, name: &ExperimentName) -> Result<Vec<String>> {
+    let output = Command::new("docker")
+        .args(compose_args(
+            dir,
+            name,
+            &Profiles::None,
+            &["config", "--profiles"],
+        ))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("running `docker compose config --profiles`")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "`docker compose config --profiles` exited with {}",
+            output.status
+        );
+    }
+
+    let mut profiles: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    profiles.sort();
+
+    Ok(profiles)
 }
 
 fn require_docker() -> Result<()> {
@@ -362,7 +917,36 @@ mod tests {
     use crate::testutil::TempDir;
 
     fn names(list: &EnabledList) -> Vec<&str> {
-        list.names.iter().map(ExperimentName::as_str).collect()
+        list.targets
+            .iter()
+            .map(|target| target.name.as_str())
+            .collect()
+    }
+
+    fn target(spec: &str) -> Target {
+        Target::parse(spec).expect("valid target")
+    }
+
+    fn profiles(specs: &[&str]) -> Profiles {
+        Profiles::Named(
+            specs
+                .iter()
+                .map(|spec| ProfileName::new(spec).expect("valid profile"))
+                .collect(),
+        )
+    }
+
+    /// An experiments directory with a compose file for each of `names`.
+    fn experiments_dir(tmp: &TempDir, names: &[&str]) -> PathBuf {
+        let paths = Paths::for_test(tmp.path());
+        let dir = paths.experiments_dir();
+
+        for name in names {
+            conf::write_atomically(&dir.join(name).join("docker-compose.yml"), "services: {}\n")
+                .unwrap();
+        }
+
+        dir
     }
 
     #[test]
@@ -405,6 +989,84 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_name_activates_no_profiles() {
+        assert_eq!(
+            target("slam"),
+            Target::new(ExperimentName::new("slam").unwrap(), Profiles::None)
+        );
+    }
+
+    #[test]
+    fn a_trailing_colon_is_an_explicit_way_to_say_no_profiles() {
+        // Same meaning as the bare name, spelled deliberately: "I know enabled.conf configures
+        // profiles for this one, and I want none of them."
+        assert_eq!(target("slam:"), target("slam"));
+    }
+
+    #[test]
+    fn parses_a_profile_list() {
+        assert_eq!(target("slam:gpu").profiles, profiles(&["gpu"]));
+        assert_eq!(
+            target("slam:gpu,debug").profiles,
+            profiles(&["gpu", "debug"])
+        );
+        assert_eq!(
+            target(" slam : gpu , debug ").profiles,
+            profiles(&["gpu", "debug"])
+        );
+    }
+
+    #[test]
+    fn a_profile_repeated_in_one_list_is_listed_once() {
+        assert_eq!(target("slam:gpu,gpu").profiles, profiles(&["gpu"]));
+    }
+
+    #[test]
+    fn the_wildcard_means_every_profile_and_stands_alone() {
+        assert_eq!(target("slam:*").profiles, Profiles::All);
+
+        assert_eq!(
+            Target::parse("slam:*,gpu"),
+            Err(TargetError::WildcardWithOthers)
+        );
+        assert_eq!(
+            Target::parse("slam:gpu,*"),
+            Err(TargetError::WildcardWithOthers)
+        );
+    }
+
+    #[test]
+    fn rejects_bad_names_and_bad_profiles_with_the_offending_part_named() {
+        let err = Target::parse("../escape:gpu").unwrap_err();
+        assert!(err.to_string().contains("../escape"), "{err}");
+
+        let err = Target::parse("slam:gpu,").unwrap_err();
+        assert!(err.to_string().contains("compose profile"), "{err}");
+
+        let err = Target::parse("slam:has space").unwrap_err();
+        assert!(err.to_string().contains("has space"), "{err}");
+
+        // An extra colon lands in the profile list, where it is invalid.
+        assert!(Target::parse("slam:gpu:debug").is_err());
+    }
+
+    #[test]
+    fn profile_names_follow_composes_own_rules() {
+        use ProfileNameError as E;
+
+        assert!(ProfileName::new("gpu-2.0_x").is_ok());
+        assert_eq!(ProfileName::new(""), Err(E::Empty));
+        assert_eq!(
+            ProfileName::new("-gpu"),
+            Err(E::InvalidStart { found: '-' })
+        );
+        assert_eq!(
+            ProfileName::new("gpu!"),
+            Err(E::InvalidCharacter { found: '!' })
+        );
+    }
+
+    #[test]
     fn ignores_comments_and_blank_lines() {
         let text = "# a comment\n\n  \nobstacle-avoidance\n\t\n# another\nslam\n";
 
@@ -423,8 +1085,24 @@ mod tests {
     }
 
     #[test]
+    fn enabled_conf_carries_per_experiment_profiles() {
+        // The only way a per-robot profile choice can exist: the boot unit's ExecStart is baked
+        // into the image, so it cannot carry one.
+        let list = parse_enabled("slam:gpu\nnav\nteleop:debug,sim\nviz:*\n");
+
+        assert_eq!(names(&list), ["slam", "nav", "teleop", "viz"]);
+        assert_eq!(list.targets[0].profiles, profiles(&["gpu"]));
+        assert_eq!(list.targets[1].profiles, Profiles::None);
+        assert_eq!(list.targets[2].profiles, profiles(&["debug", "sim"]));
+        assert_eq!(list.targets[3].profiles, Profiles::All);
+        assert!(list.warnings.is_empty());
+    }
+
+    #[test]
     fn drops_duplicates_and_says_so() {
-        let list = parse_enabled("slam\nobstacle\nslam\n");
+        // Unlike the command line, where a repeated name merges: a file listing one twice is a
+        // mistake to point at, not something to reconcile.
+        let list = parse_enabled("slam\nobstacle\nslam:gpu\n");
 
         assert_eq!(names(&list), ["slam", "obstacle"]);
         assert_eq!(list.warnings.len(), 1);
@@ -434,11 +1112,12 @@ mod tests {
 
     #[test]
     fn one_bad_line_does_not_discard_the_good_ones() {
-        let list = parse_enabled("good-one\n../escape\nanother-good\n");
+        let list = parse_enabled("good-one\n../escape\nanother-good\nbad:pro file\n");
 
         assert_eq!(names(&list), ["good-one", "another-good"]);
-        assert_eq!(list.warnings.len(), 1);
+        assert_eq!(list.warnings.len(), 2);
         assert!(list.warnings[0].contains("line 2"));
+        assert!(list.warnings[1].contains("line 4"));
     }
 
     #[test]
@@ -536,5 +1215,155 @@ mod tests {
             compose_file(Path::new("/data/experiments"), &name),
             Path::new("/data/experiments/slam/docker-compose.yml")
         );
+    }
+
+    #[test]
+    fn profile_flags_precede_the_verb() {
+        // `--profile` is a compose-level flag; after the verb it is a different flag or an error.
+        let dir = Path::new("/data/experiments");
+        let name = ExperimentName::new("slam").unwrap();
+
+        assert_eq!(
+            compose_args(dir, &name, &profiles(&["gpu", "debug"]), &["up", "-d"]),
+            [
+                "compose",
+                "-f",
+                "/data/experiments/slam/docker-compose.yml",
+                "--project-directory",
+                "/data/experiments/slam",
+                "--profile",
+                "gpu",
+                "--profile",
+                "debug",
+                "up",
+                "-d",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_profiles_means_no_profile_flags_at_all() {
+        let dir = Path::new("/data/experiments");
+        let name = ExperimentName::new("slam").unwrap();
+
+        let args = compose_args(dir, &name, &Profiles::None, &["ps"]);
+
+        assert!(!args.contains(&"--profile".to_string()));
+        assert_eq!(args.last().unwrap(), "ps");
+    }
+
+    #[test]
+    fn the_wildcard_becomes_composes_own_star() {
+        assert_eq!(Profiles::All.args(), ["--profile", "*"]);
+    }
+
+    #[test]
+    fn naming_an_experiment_twice_merges_its_profiles() {
+        let merged = merge_duplicates(vec![
+            target("slam:gpu"),
+            target("nav"),
+            target("slam:debug"),
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name.as_str(), "slam");
+        assert_eq!(merged[0].profiles, profiles(&["gpu", "debug"]));
+        assert_eq!(merged[1].name.as_str(), "nav");
+    }
+
+    #[test]
+    fn merging_the_wildcard_swallows_the_rest() {
+        let merged = merge_duplicates(vec![target("slam:gpu"), target("slam:*")]);
+
+        assert_eq!(merged[0].profiles, Profiles::All);
+    }
+
+    #[test]
+    fn a_named_experiment_that_does_not_exist_stops_everything() {
+        // A typo must not half-execute the command: nothing is started, and the message names
+        // every missing one rather than just the first.
+        let tmp = TempDir::new("experiments-missing");
+        let paths = Paths::for_test(tmp.path());
+        experiments_dir(&tmp, &["slam"]);
+
+        let err = select(
+            &paths,
+            vec![target("slam"), target("slma"), target("navv:gpu")],
+            Fallback::Enabled,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("slma"), "{err}");
+        assert!(err.contains("navv"), "{err}");
+        assert!(!err.contains("'slam'"), "{err}");
+        assert!(err.contains("nothing was done"), "{err}");
+    }
+
+    #[test]
+    fn a_named_experiment_need_not_be_enabled() {
+        let tmp = TempDir::new("experiments-adhoc");
+        let paths = Paths::for_test(tmp.path());
+        let dir = experiments_dir(&tmp, &["slam"]);
+        conf::write_atomically(&dir.join("enabled.conf"), "# nothing enabled\n").unwrap();
+
+        let (_, targets) = select(&paths, vec![target("slam:gpu")], Fallback::Enabled).unwrap();
+
+        assert_eq!(targets, [target("slam:gpu")]);
+    }
+
+    #[test]
+    fn naming_nothing_falls_back_to_enabled_conf_with_its_profiles() {
+        let tmp = TempDir::new("experiments-enabled");
+        let paths = Paths::for_test(tmp.path());
+        let dir = experiments_dir(&tmp, &["slam", "nav", "teleop"]);
+        conf::write_atomically(&dir.join("enabled.conf"), "slam:gpu\nnav\nghost\n").unwrap();
+
+        let (_, targets) = select(&paths, Vec::new(), Fallback::Enabled).unwrap();
+
+        // `ghost` is enabled but has no compose file: a warning and a skip, not a failure.
+        assert_eq!(targets, [target("slam:gpu"), target("nav")]);
+    }
+
+    #[test]
+    fn stopping_nothing_in_particular_sweeps_every_stack_on_disk() {
+        // The point of the sweep: `zeta` was dropped from enabled.conf but is still running, and
+        // nothing else would ever bring it down.
+        let tmp = TempDir::new("experiments-sweep");
+        let paths = Paths::for_test(tmp.path());
+        let dir = experiments_dir(&tmp, &["nav", "zeta", "alpha"]);
+        conf::write_atomically(&dir.join("enabled.conf"), "nav\n").unwrap();
+
+        let (_, targets) = select(&paths, Vec::new(), Fallback::EverythingOnDisk).unwrap();
+
+        assert_eq!(
+            targets,
+            [target("alpha"), target("nav"), target("zeta")],
+            "swept in name order"
+        );
+    }
+
+    #[test]
+    fn the_disk_sweep_ignores_directories_without_a_compose_file() {
+        let tmp = TempDir::new("experiments-junk");
+        let dir = experiments_dir(&tmp, &["slam"]);
+        fs::create_dir_all(dir.join("not-an-experiment")).unwrap();
+        // A plain file in the directory is not a stack either.
+        conf::write_atomically(&dir.join("enabled.conf"), "slam\n").unwrap();
+
+        assert_eq!(
+            on_disk(&dir).unwrap(),
+            [ExperimentName::new("slam").unwrap()]
+        );
+    }
+
+    #[test]
+    fn an_absent_experiments_directory_sweeps_to_nothing() {
+        let tmp = TempDir::new("experiments-absent");
+        let paths = Paths::for_test(tmp.path());
+
+        let (_, targets) = select(&paths, Vec::new(), Fallback::EverythingOnDisk).unwrap();
+
+        assert!(targets.is_empty());
     }
 }

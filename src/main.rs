@@ -134,35 +134,58 @@ impl WifiAction {
     }
 }
 
+/// The `[EXPERIMENT...]` help shared by every verb that takes one, since the syntax is the
+/// interesting part and it is identical across them.
+const EXPERIMENT_HELP: &str = "Experiments to act on, as `name`, `name:profile,profile` or \
+                               `name:*` (every profile the compose file declares). Naming one \
+                               replaces the profiles enabled.conf configures for it, so a bare \
+                               `name` activates none. A name with no compose file is an error \
+                               and nothing is done.";
+
 #[derive(Subcommand, Debug)]
 enum ExperimentsAction {
-    /// Pull images and bring every enabled stack up.
+    /// Pull images and bring stacks up. Defaults to everything in enabled.conf.
     ///
     /// A failed pull is fatal and the stack is not started
     Start {
-        /// Override IGNORE_PULL_FAILURES from experiments.conf for this run.
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        #[arg(value_name = "EXPERIMENT", value_parser = experiments::Target::parse, help = EXPERIMENT_HELP)]
+        targets: Vec<experiments::Target>,
+
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         ignore_pull_failures: Option<bool>,
     },
-    /// Bring every enabled stack down.
-    Stop,
-    /// Show `docker compose ps` for every enabled stack.
-    Status,
+    /// Bring stacks down. Defaults to every stack on disk, not just the enabled ones.
+    ///
+    /// Every profile is torn down unless the argument narrows it to specific ones.
+    Stop {
+        #[arg(value_name = "EXPERIMENT", value_parser = experiments::Target::parse, help = EXPERIMENT_HELP)]
+        targets: Vec<experiments::Target>,
+    },
+    /// Show `docker compose ps`. Defaults to everything in enabled.conf.
+    Status {
+        #[arg(value_name = "EXPERIMENT", value_parser = experiments::Target::parse, help = EXPERIMENT_HELP)]
+        targets: Vec<experiments::Target>,
+    },
+    /// List the stacks on this robot, which are enabled, and their profiles.
+    List,
 }
 
 impl ExperimentsAction {
     fn run(self, paths: &Paths) -> Result<()> {
         match self {
             ExperimentsAction::Start {
+                targets,
                 ignore_pull_failures,
             } => experiments::start(
                 paths,
+                targets,
                 experiments::StartOptions {
                     ignore_pull_failures,
                 },
             ),
-            ExperimentsAction::Stop => experiments::stop(paths),
-            ExperimentsAction::Status => experiments::status(paths),
+            ExperimentsAction::Stop { targets } => experiments::stop(paths, targets),
+            ExperimentsAction::Status { targets } => experiments::status(paths, targets),
+            ExperimentsAction::List => experiments::list(paths),
         }
     }
 }

@@ -178,7 +178,10 @@ mod tests {
     fn a_hook_that_finishes_inside_its_limit_is_left_alone() {
         let dir = TempDir::new("hook-slow");
         let record = dir.path().join("states");
-        let hook = script(&dir, &format!("sleep 0.05\necho done >> {}\n", record.display()));
+        let hook = script(
+            &dir,
+            &format!("sleep 0.05\necho done >> {}\n", record.display()),
+        );
 
         notify_within(
             &hook,
